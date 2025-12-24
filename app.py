@@ -1,3 +1,8 @@
+import os
+os.environ["OPENCV_VIDEOIO_PRIORITY_MSMF"] = "0"
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
+
+
 import streamlit as st
 import os
 import cv2

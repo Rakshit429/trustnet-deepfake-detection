@@ -1,9 +1,17 @@
 streamlit==1.52.2
+
+# --- FORCE HEADLESS OPENCV ---
 opencv-python-headless==4.8.1.78
+
+# --- FACE DETECTION ---
 mtcnn==0.1.1
 tensorflow==2.12.0
-torch
-torchvision
-transformers
-numpy
+
+# --- DEEPFAKE MODEL ---
+torch==2.0.1
+torchvision==0.15.2
+transformers==4.36.2
+
+# --- BASICS ---
+numpy==1.23.5
 pillow
