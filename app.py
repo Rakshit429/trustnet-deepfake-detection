@@ -1,9 +1,9 @@
 import streamlit as st
 import os
 import cv2
-from mtcnn import MTCNN
 import torch
 import numpy as np
+from mtcnn import MTCNN
 from PIL import Image
 from transformers import AutoImageProcessor, AutoModelForImageClassification
 
@@ -43,11 +43,7 @@ with st.sidebar:
     - 🧠 Deepfake Analysis  
     - 🧾 Explainable Verdict  
     """)
-
-    st.markdown("---")
-    st.markdown("**Model**: Hugging Face Deepfake Classifier")
-    st.markdown("**Inference**: CPU")
-    st.markdown("**Explainability**: Enabled")
+    st.info("⚠️ CPU-only inference (Streamlit Cloud)")
     st.success("✅ Explainable Analysis Active")
 
 # =========================
@@ -57,49 +53,40 @@ UPLOAD_FOLDER = "uploaded_videos"
 FRAMES_FOLDER = "extracted_frames"
 FACES_FOLDER = "extracted_faces"
 
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(FRAMES_FOLDER, exist_ok=True)
-os.makedirs(FACES_FOLDER, exist_ok=True)
+for folder in [UPLOAD_FOLDER, FRAMES_FOLDER, FACES_FOLDER]:
+    os.makedirs(folder, exist_ok=True)
 
 # =========================
 # UPLOAD
 # =========================
 st.subheader("📤 Upload Media for Verification")
-st.caption("Supported formats: MP4, AVI, MOV")
-
 uploaded_video = st.file_uploader(
     "Choose a video file",
     type=["mp4", "avi", "mov"]
 )
 
 # =========================
-# FRAME EXTRACTION (ADAPTIVE)
+# FRAME EXTRACTION
 # =========================
-def extract_frames(video_path, output_folder, max_cap=400):
+def extract_frames(video_path, output_folder, max_cap=200):
     os.makedirs(output_folder, exist_ok=True)
     cap = cv2.VideoCapture(video_path)
 
     if not cap.isOpened():
-        st.error("❌ Unable to read video")
         return 0
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-    if fps <= 0 or total_frames <= 0:
-        fps = 30
-        total_frames = 300
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 300)
 
     duration_sec = total_frames / fps
-    desired_frames = min(int(duration_sec * 0.5), max_cap)
+    desired_frames = min(int(duration_sec * 0.3), max_cap)
     interval = max(total_frames // max(desired_frames, 1), 1)
 
-    count, saved = 0, 0
-    while True:
+    saved, count = 0, 0
+    while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
-
         if count % interval == 0:
             cv2.imwrite(
                 os.path.join(output_folder, f"frame_{saved}.jpg"),
@@ -116,8 +103,12 @@ def extract_frames(video_path, output_folder, max_cap=400):
 # =========================
 # FACE EXTRACTION
 # =========================
+@st.cache_resource
+def load_face_detector():
+    return MTCNN()
+
 def extract_faces(frames_folder, faces_folder):
-    detector = MTCNN(device='CPU:0')
+    detector = load_face_detector()
     os.makedirs(faces_folder, exist_ok=True)
     face_count = 0
 
@@ -142,10 +133,13 @@ def extract_faces(frames_folder, faces_folder):
             )
             face_count += 1
 
+            if face_count >= 50:  # HARD LIMIT FOR CLOUD
+                return face_count
+
     return face_count
 
 # =========================
-# BLUR / TEXTURE ANALYSIS
+# BLUR SCORE
 # =========================
 def blur_score(image_path):
     img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
@@ -154,48 +148,43 @@ def blur_score(image_path):
     return cv2.Laplacian(img, cv2.CV_64F).var()
 
 # =========================
-# DEEPFAKE MODEL (HF)
+# DEEPFAKE MODEL
 # =========================
-class DeepfakeDetector:
-    def __init__(self):
-        self.model_name = "prithivMLmods/Deep-Fake-Detector-Model"
+@st.cache_resource
+def load_deepfake_model():
+    model_name = "prithivMLmods/Deep-Fake-Detector-Model"
+    processor = AutoImageProcessor.from_pretrained(model_name)
+    model = AutoModelForImageClassification.from_pretrained(model_name)
+    model.eval()
+    return processor, model
 
-        self.processor = AutoImageProcessor.from_pretrained(self.model_name)
-        self.model = AutoModelForImageClassification.from_pretrained(self.model_name)
+def predict_face(image_path):
+    processor, model = load_deepfake_model()
+    image = Image.open(image_path).convert("RGB")
+    inputs = processor(images=image, return_tensors="pt")
 
-        self.model.eval()
+    with torch.no_grad():
+        outputs = model(**inputs)
+        probs = torch.softmax(outputs.logits, dim=1)[0]
 
-    def predict(self, image_path):
-        image = Image.open(image_path).convert("RGB")
-        inputs = self.processor(images=image, return_tensors="pt")
-
-        with torch.no_grad():
-            outputs = self.model(**inputs)
-            probs = torch.softmax(outputs.logits, dim=1)[0]
-
-        fake_prob = probs[0].item()
-        real_prob = probs[1].item()
-
-        return real_prob, fake_prob
+    return probs[1].item(), probs[0].item()
 
 # =========================
-# AGGREGATION + EXPLANATION SIGNALS
+# ANALYSIS
 # =========================
 def analyze_faces(faces_folder):
-    detector = DeepfakeDetector()
     real_scores, fake_scores, blur_scores = [], [], []
 
-    face_files = os.listdir(faces_folder)
-    if len(face_files) == 0:
+    face_files = os.listdir(faces_folder)[:50]
+    if not face_files:
         return None, None, None, None
 
     for face in face_files:
-        face_path = os.path.join(faces_folder, face)
-
-        real, fake = detector.predict(face_path)
+        path = os.path.join(faces_folder, face)
+        real, fake = predict_face(path)
         real_scores.append(real)
         fake_scores.append(fake)
-        blur_scores.append(blur_score(face_path))
+        blur_scores.append(blur_score(path))
 
     return (
         float(np.mean(real_scores)),
@@ -205,9 +194,9 @@ def analyze_faces(faces_folder):
     )
 
 # =========================
-# PIPELINE EXECUTION
+# PIPELINE
 # =========================
-if uploaded_video is not None:
+if uploaded_video:
     st.markdown("### 🔄 Processing Pipeline")
     progress = st.progress(0)
 
@@ -232,7 +221,9 @@ if uploaded_video is not None:
     real_score, fake_score, variance, avg_blur = analyze_faces(faces_output)
     progress.progress(100)
 
-    if real_score is not None:
+    if real_score is None:
+        st.warning("No faces detected. Try a clearer video.")
+    else:
         col1, col2, col3 = st.columns(3)
         col1.metric("🟢 Real Probability", f"{real_score:.2f}")
         col2.metric("🔴 Fake Probability", f"{fake_score:.2f}")
@@ -242,58 +233,6 @@ if uploaded_video is not None:
         margin = abs(fake_score - real_score)
 
         if fake_score > real_score and margin > 0.1:
-            st.error("🚨 **High Confidence Deepfake Detected**")
+            st.error("🚨 High Confidence Deepfake Detected")
         elif real_score > fake_score and margin > 0.1:
-            st.success("✅ **Media Appears Authentic**")
-        else:
-            st.warning("⚠️ **Uncertain — Manual Review Recommended**")
-
-        # =========================
-        # EXPLANATION
-        # =========================
-        st.markdown("### 🧠 Why this verdict?")
-
-        explanations = []
-        explanations.append(
-            f"Analyzed {faces_count} face samples uniformly extracted across the video."
-        )
-
-        if variance < 0.02:
-            explanations.append(
-                "Predictions were consistent across frames, indicating stable visual patterns."
-            )
-        else:
-            explanations.append(
-                "Predictions varied across frames, reducing confidence."
-            )
-
-        if avg_blur < 100:
-            explanations.append(
-                "Detected unusually smooth facial textures, which may indicate synthetic artifacts."
-            )
-        else:
-            explanations.append(
-                "Facial texture sharpness appears natural across frames."
-            )
-
-        if margin > 0.3:
-            explanations.append(
-                "The model showed a strong confidence separation between real and fake classes."
-            )
-        else:
-            explanations.append(
-                "The confidence difference between real and fake predictions was marginal."
-            )
-
-        for exp in explanations:
-            st.write("•", exp)
-
-        with st.expander("👀 Preview Extracted Faces"):
-            face_files = os.listdir(faces_output)[:5]
-            cols = st.columns(len(face_files))
-            for col, face in zip(cols, face_files):
-                col.image(os.path.join(faces_output, face), width=150)
-
-    st.markdown("---")
-    st.caption("© TrustNet – Hackathon Prototype | Explainable Agentic AI System")
-
+            st.suc
