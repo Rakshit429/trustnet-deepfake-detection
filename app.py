@@ -1,16 +1,11 @@
-import os
-os.environ["OPENCV_VIDEOIO_PRIORITY_MSMF"] = "0"
-os.environ["QT_QPA_PLATFORM"] = "offscreen"
-
-
 import streamlit as st
 import os
-import cv2
 import torch
 import numpy as np
 from mtcnn import MTCNN
 from PIL import Image
-from transformers import AutoImageProcessor, AutoModelForImageClassification
+import imageio
+from transformers import ViTImageProcessor, AutoModelForImageClassification
 
 # =========================
 # PAGE CONFIG
@@ -49,7 +44,7 @@ with st.sidebar:
     - 🧾 Explainable Verdict  
     """)
     st.info("⚠️ CPU-only inference (Streamlit Cloud)")
-    st.success("✅ Explainable Analysis Active")
+    st.success("✅ Cloud-safe (No OpenCV)")
 
 # =========================
 # FOLDERS
@@ -71,42 +66,36 @@ uploaded_video = st.file_uploader(
 )
 
 # =========================
-# FRAME EXTRACTION
+# FRAME EXTRACTION (NO OPENCV)
 # =========================
 def extract_frames(video_path, output_folder, max_cap=200):
     os.makedirs(output_folder, exist_ok=True)
-    cap = cv2.VideoCapture(video_path)
 
-    if not cap.isOpened():
-        return 0
+    reader = imageio.get_reader(video_path)
+    meta = reader.get_meta_data()
 
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 300)
+    fps = meta.get("fps", 30)
+    total_frames = meta.get("nframes", 300)
 
     duration_sec = total_frames / fps
     desired_frames = min(int(duration_sec * 0.3), max_cap)
     interval = max(total_frames // max(desired_frames, 1), 1)
 
-    saved, count = 0, 0
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if count % interval == 0:
-            cv2.imwrite(
-                os.path.join(output_folder, f"frame_{saved}.jpg"),
-                frame
+    saved = 0
+    for i, frame in enumerate(reader):
+        if i % interval == 0:
+            Image.fromarray(frame).save(
+                os.path.join(output_folder, f"frame_{saved}.jpg")
             )
             saved += 1
             if saved >= desired_frames:
                 break
-        count += 1
 
-    cap.release()
+    reader.close()
     return saved
 
 # =========================
-# FACE EXTRACTION
+# FACE EXTRACTION (MTCNN)
 # =========================
 @st.cache_resource
 def load_face_detector():
@@ -119,59 +108,65 @@ def extract_faces(frames_folder, faces_folder):
 
     for img_name in os.listdir(frames_folder):
         img_path = os.path.join(frames_folder, img_name)
-        image = cv2.imread(img_path)
-        if image is None:
-            continue
+        image = Image.open(img_path).convert("RGB")
+        image_np = np.array(image)
 
-        faces = detector.detect_faces(image)
+        faces = detector.detect_faces(image_np)
         for face in faces:
             x, y, w, h = face["box"]
             x, y = max(0, x), max(0, y)
-            face_img = image[y:y+h, x:x+w]
 
+            face_img = image_np[y:y+h, x:x+w]
             if face_img.size == 0:
                 continue
 
-            cv2.imwrite(
-                os.path.join(faces_folder, f"face_{face_count}.jpg"),
-                face_img
+            Image.fromarray(face_img).save(
+                os.path.join(faces_folder, f"face_{face_count}.jpg")
             )
             face_count += 1
 
-            if face_count >= 50:  # HARD LIMIT FOR CLOUD
+            if face_count >= 50:  # HARD CLOUD LIMIT
                 return face_count
 
     return face_count
 
 # =========================
-# BLUR SCORE
+# BLUR SCORE (NO OPENCV)
 # =========================
 def blur_score(image_path):
-    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-    if img is None:
-        return 0
-    return cv2.Laplacian(img, cv2.CV_64F).var()
+    img = np.array(Image.open(image_path).convert("L"), dtype=np.float32)
+    gy, gx = np.gradient(img)
+    return float(np.mean(gx**2 + gy**2))
 
 # =========================
-# DEEPFAKE MODEL
+# DEEPFAKE MODEL (FIXED)
 # =========================
 @st.cache_resource
 def load_deepfake_model():
     model_name = "prithivMLmods/Deep-Fake-Detector-Model"
-    processor = AutoImageProcessor.from_pretrained(model_name)
+
+    processor = ViTImageProcessor.from_pretrained(
+        model_name,
+        do_resize=True,
+        size=224,
+        do_normalize=True
+    )
+
     model = AutoModelForImageClassification.from_pretrained(model_name)
     model.eval()
+
     return processor, model
 
 def predict_face(image_path):
     processor, model = load_deepfake_model()
     image = Image.open(image_path).convert("RGB")
-    inputs = processor(images=image, return_tensors="pt")
 
+    inputs = processor(images=image, return_tensors="pt")
     with torch.no_grad():
         outputs = model(**inputs)
         probs = torch.softmax(outputs.logits, dim=1)[0]
 
+    # index 0 = fake, index 1 = real
     return probs[1].item(), probs[0].item()
 
 # =========================
@@ -240,4 +235,17 @@ if uploaded_video:
         if fake_score > real_score and margin > 0.1:
             st.error("🚨 High Confidence Deepfake Detected")
         elif real_score > fake_score and margin > 0.1:
-            st.suc
+            st.success("✅ Media Appears Authentic")
+        else:
+            st.warning("⚠️ Uncertain — Manual Review Recommended")
+
+        st.markdown("### 🧠 Why this verdict?")
+        reasons = [
+            f"Analyzed {faces_count} face samples.",
+            "Consistent predictions across frames." if variance < 0.02 else "High variance across frames.",
+            "Abnormally smooth textures detected." if avg_blur < 100 else "Natural facial texture."
+        ]
+        for r in reasons:
+            st.write("•", r)
+
+    st.caption("© TrustNet – Hackathon Prototype | Streamlit Cloud Ready")
