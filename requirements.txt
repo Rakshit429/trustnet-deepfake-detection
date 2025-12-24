@@ -4,6 +4,6 @@ torchvision
 transformers
 facenet-pytorch
 pillow
-imageio
+imageio[ffmpeg]
 numpy
 scipy
