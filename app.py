@@ -2,9 +2,9 @@ import streamlit as st
 import os
 import torch
 import numpy as np
-from mtcnn import MTCNN
 from PIL import Image
 import imageio
+from facenet_pytorch import MTCNN
 from transformers import ViTImageProcessor, AutoModelForImageClassification
 
 # =========================
@@ -38,13 +38,13 @@ with st.sidebar:
     st.markdown("""
     **Pipeline**
     - 🎥 Video Upload  
-    - 🖼️ Adaptive Frame Sampling  
+    - 🖼️ Frame Sampling  
     - 🙂 Face Detection  
     - 🧠 Deepfake Analysis  
-    - 🧾 Explainable Verdict  
+    - 🧾 Verdict  
     """)
-    st.info("⚠️ CPU-only inference (Streamlit Cloud)")
-    st.success("✅ Cloud-safe (No OpenCV)")
+    st.info("⚠️ CPU-only (Streamlit Cloud)")
+    st.success("✅ Fully Cloud Compatible")
 
 # =========================
 # FOLDERS
@@ -53,199 +53,139 @@ UPLOAD_FOLDER = "uploaded_videos"
 FRAMES_FOLDER = "extracted_frames"
 FACES_FOLDER = "extracted_faces"
 
-for folder in [UPLOAD_FOLDER, FRAMES_FOLDER, FACES_FOLDER]:
-    os.makedirs(folder, exist_ok=True)
+for f in [UPLOAD_FOLDER, FRAMES_FOLDER, FACES_FOLDER]:
+    os.makedirs(f, exist_ok=True)
 
 # =========================
 # UPLOAD
 # =========================
-st.subheader("📤 Upload Media for Verification")
 uploaded_video = st.file_uploader(
-    "Choose a video file",
+    "📤 Upload a video",
     type=["mp4", "avi", "mov"]
 )
 
 # =========================
-# FRAME EXTRACTION (NO OPENCV)
+# FRAME EXTRACTION
 # =========================
-def extract_frames(video_path, output_folder, max_cap=200):
-    os.makedirs(output_folder, exist_ok=True)
-
+def extract_frames(video_path, out_dir, max_cap=200):
     reader = imageio.get_reader(video_path)
     meta = reader.get_meta_data()
 
     fps = meta.get("fps", 30)
-    total_frames = meta.get("nframes", 300)
+    total = meta.get("nframes", 300)
 
-    duration_sec = total_frames / fps
-    desired_frames = min(int(duration_sec * 0.3), max_cap)
-    interval = max(total_frames // max(desired_frames, 1), 1)
+    desired = min(int((total / fps) * 0.3), max_cap)
+    interval = max(total // max(desired, 1), 1)
 
-    saved = 0
+    count = 0
     for i, frame in enumerate(reader):
         if i % interval == 0:
-            Image.fromarray(frame).save(
-                os.path.join(output_folder, f"frame_{saved}.jpg")
-            )
-            saved += 1
-            if saved >= desired_frames:
+            Image.fromarray(frame).save(f"{out_dir}/frame_{count}.jpg")
+            count += 1
+            if count >= desired:
                 break
 
     reader.close()
-    return saved
 
 # =========================
-# FACE EXTRACTION (MTCNN)
+# FACE DETECTOR (SAFE)
 # =========================
 @st.cache_resource
 def load_face_detector():
-    return MTCNN()
+    return MTCNN(keep_all=True, device="cpu")
 
-def extract_faces(frames_folder, faces_folder):
+def extract_faces(frames_dir, faces_dir):
     detector = load_face_detector()
-    os.makedirs(faces_folder, exist_ok=True)
     face_count = 0
 
-    for img_name in os.listdir(frames_folder):
-        img_path = os.path.join(frames_folder, img_name)
-        image = Image.open(img_path).convert("RGB")
-        image_np = np.array(image)
+    for img in os.listdir(frames_dir):
+        image = Image.open(os.path.join(frames_dir, img)).convert("RGB")
+        faces = detector(image)
 
-        faces = detector.detect_faces(image_np)
+        if faces is None:
+            continue
+
         for face in faces:
-            x, y, w, h = face["box"]
-            x, y = max(0, x), max(0, y)
-
-            face_img = image_np[y:y+h, x:x+w]
-            if face_img.size == 0:
-                continue
-
-            Image.fromarray(face_img).save(
-                os.path.join(faces_folder, f"face_{face_count}.jpg")
-            )
+            face = (face.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            Image.fromarray(face).save(f"{faces_dir}/face_{face_count}.jpg")
             face_count += 1
 
-            if face_count >= 50:  # HARD CLOUD LIMIT
+            if face_count >= 50:
                 return face_count
 
     return face_count
 
 # =========================
-# BLUR SCORE (NO OPENCV)
+# BLUR SCORE
 # =========================
-def blur_score(image_path):
-    img = np.array(Image.open(image_path).convert("L"), dtype=np.float32)
-    gy, gx = np.gradient(img)
+def blur_score(path):
+    img = np.array(Image.open(path).convert("L"), dtype=np.float32)
+    gx, gy = np.gradient(img)
     return float(np.mean(gx**2 + gy**2))
 
 # =========================
-# DEEPFAKE MODEL (FIXED)
+# DEEPFAKE MODEL
 # =========================
 @st.cache_resource
-def load_deepfake_model():
-    model_name = "prithivMLmods/Deep-Fake-Detector-Model"
-
-    processor = ViTImageProcessor.from_pretrained(
-        model_name,
-        do_resize=True,
-        size=224,
-        do_normalize=True
-    )
-
-    model = AutoModelForImageClassification.from_pretrained(model_name)
+def load_model():
+    name = "prithivMLmods/Deep-Fake-Detector-Model"
+    processor = ViTImageProcessor.from_pretrained(name)
+    model = AutoModelForImageClassification.from_pretrained(name)
     model.eval()
-
     return processor, model
 
-def predict_face(image_path):
-    processor, model = load_deepfake_model()
-    image = Image.open(image_path).convert("RGB")
-
+def predict_face(path):
+    processor, model = load_model()
+    image = Image.open(path).convert("RGB")
     inputs = processor(images=image, return_tensors="pt")
-    with torch.no_grad():
-        outputs = model(**inputs)
-        probs = torch.softmax(outputs.logits, dim=1)[0]
 
-    # index 0 = fake, index 1 = real
+    with torch.no_grad():
+        probs = torch.softmax(model(**inputs).logits, dim=1)[0]
+
     return probs[1].item(), probs[0].item()
 
 # =========================
 # ANALYSIS
 # =========================
-def analyze_faces(faces_folder):
-    real_scores, fake_scores, blur_scores = [], [], []
+def analyze_faces(folder):
+    real, fake, blur = [], [], []
 
-    face_files = os.listdir(faces_folder)[:50]
-    if not face_files:
-        return None, None, None, None
+    for f in os.listdir(folder)[:50]:
+        p = os.path.join(folder, f)
+        r, f_ = predict_face(p)
+        real.append(r)
+        fake.append(f_)
+        blur.append(blur_score(p))
 
-    for face in face_files:
-        path = os.path.join(faces_folder, face)
-        real, fake = predict_face(path)
-        real_scores.append(real)
-        fake_scores.append(fake)
-        blur_scores.append(blur_score(path))
+    if not real:
+        return None
 
-    return (
-        float(np.mean(real_scores)),
-        float(np.mean(fake_scores)),
-        float(np.var(fake_scores)),
-        float(np.mean(blur_scores))
-    )
+    return np.mean(real), np.mean(fake), np.var(fake), np.mean(blur)
 
 # =========================
 # PIPELINE
 # =========================
 if uploaded_video:
-    st.markdown("### 🔄 Processing Pipeline")
-    progress = st.progress(0)
+    st.video(uploaded_video)
 
-    video_path = os.path.join(UPLOAD_FOLDER, uploaded_video.name)
+    video_path = f"{UPLOAD_FOLDER}/{uploaded_video.name}"
     with open(video_path, "wb") as f:
         f.write(uploaded_video.getbuffer())
 
-    st.video(video_path)
-    progress.progress(20)
+    extract_frames(video_path, FRAMES_FOLDER)
+    faces_count = extract_faces(FRAMES_FOLDER, FACES_FOLDER)
 
-    video_name = os.path.splitext(uploaded_video.name)[0]
-    frames_output = os.path.join(FRAMES_FOLDER, video_name)
-    faces_output = os.path.join(FACES_FOLDER, video_name)
+    result = analyze_faces(FACES_FOLDER)
 
-    extract_frames(video_path, frames_output)
-    progress.progress(40)
-
-    faces_count = extract_faces(frames_output, faces_output)
-    progress.progress(60)
-
-    st.subheader("🧠 Deepfake Analysis")
-    real_score, fake_score, variance, avg_blur = analyze_faces(faces_output)
-    progress.progress(100)
-
-    if real_score is None:
-        st.warning("No faces detected. Try a clearer video.")
+    if result is None:
+        st.warning("No faces detected.")
     else:
-        col1, col2, col3 = st.columns(3)
-        col1.metric("🟢 Real Probability", f"{real_score:.2f}")
-        col2.metric("🔴 Fake Probability", f"{fake_score:.2f}")
-        col3.metric("📊 Consistency", f"{variance:.4f}")
+        real, fake, var, blur = result
 
-        st.markdown("### 🧾 Final Verdict")
-        margin = abs(fake_score - real_score)
+        st.metric("🟢 Real", f"{real:.2f}")
+        st.metric("🔴 Fake", f"{fake:.2f}")
 
-        if fake_score > real_score and margin > 0.1:
-            st.error("🚨 High Confidence Deepfake Detected")
-        elif real_score > fake_score and margin > 0.1:
-            st.success("✅ Media Appears Authentic")
+        if fake > real:
+            st.error("🚨 Deepfake Detected")
         else:
-            st.warning("⚠️ Uncertain — Manual Review Recommended")
-
-        st.markdown("### 🧠 Why this verdict?")
-        reasons = [
-            f"Analyzed {faces_count} face samples.",
-            "Consistent predictions across frames." if variance < 0.02 else "High variance across frames.",
-            "Abnormally smooth textures detected." if avg_blur < 100 else "Natural facial texture."
-        ]
-        for r in reasons:
-            st.write("•", r)
-
-    st.caption("© TrustNet – Hackathon Prototype | Streamlit Cloud Ready")
+            st.success("✅ Appears Authentic")
